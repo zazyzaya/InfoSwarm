@@ -1,17 +1,17 @@
-import torch 
-from torch.nn import Module 
-from torch_scatter import scatter_add
+import torch
+from torch.nn import Module
+from torch_geometric.utils import scatter
 
 '''
 Implements functions described by:
 https://www.seas.ucla.edu/coopcontrol/papers/flocking_tac04b.pdf
 '''
 
-# Hyperparams from original paper on pg. 24 of the pdf 
+# Hyperparams from original paper on pg. 24 of the pdf
 D = 7
 R = 1.2*D
-D_PRIME = 0.6*D 
-R_PRIME = 1.2*D_PRIME 
+D_PRIME = 0.6*D
+R_PRIME = 1.2*D_PRIME
 EPS = 0.1
 A = B = 5; C=0
 H_ALPHA = 0.2
@@ -27,52 +27,52 @@ def sigma_norm(z):
 
     return (1/EPS) * (
         torch.sqrt(
-            1 + EPS*sq 
+            1 + EPS*sq
         ) - 1
     )
 
-def sigma_norm_gradient(z): 
+def sigma_norm_gradient(z):
     return z / (1 + EPS*sigma_norm(z))
 
 # More hyperparams, but need to define sigma norm first
 R_ALPHA = sigma_norm(torch.tensor(R)).item()
 D_ALPHA = sigma_norm(torch.tensor(D)).item()
 
-def _bump(z): 
+def _bump(z):
     '''
                           cos(pi (z-h))
-        p(z) = 1/2 * (1 + -------------  ) 
+        p(z) = 1/2 * (1 + -------------  )
                               (1-h)
 
-    For input z and some threshold h 
+    For input z and some threshold h
     '''
     return 0.5 * (
         1 + torch.cos( (torch.pi * (z-H_ALPHA)) / (1-H_ALPHA) )
     )
 
-def bump(z): 
+def bump(z):
     '''
     Smooth pairwise function Eq. 10
     '''
-    # TODO more efficient way to do this? 
-    z[(z > 0) & (z < H_ALPHA)] = 1. 
-    z[(z > 1)] = 0. 
+    # TODO more efficient way to do this?
+    z[(z > 0) & (z < H_ALPHA)] = 1.
+    z[(z > 1)] = 0.
     z[(z >= H_ALPHA) & (z <= 1)] = _bump(z[(z >= H_ALPHA) & (z <= 1)])
 
     return z
 
-def phi(z): 
+def phi(z):
     ''' Eq. 15 '''
     sig1 = lambda x : x / torch.sqrt(1 + torch.pow(x,2))
 
     return 0.5 * (
         (A+B) * sig1(z + C) + (A - B)
-    ) 
+    )
 
-def action_function(z): 
+def action_function(z):
     bump(z/R) * phi(z - D_ALPHA)
 
-def _spatial_adjecency(qi, qj): 
+def _spatial_adjecency(qi, qj):
     return bump(
         sigma_norm(qi - qj) / R_ALPHA
     )
@@ -81,13 +81,13 @@ def spatial_adjacency(q):
     a_ij = []
     src,dst = [],[]
 
-    # TODO do this with matmuls 
-    for i in range(q.shape[0]): 
+    # TODO do this with matmuls
+    for i in range(q.shape[0]):
         for j in range(q.shape[0]):
             if i == j:
                 continue
             ij = _spatial_adjecency(q[i], q[j])
-            
+
             if ij != 0:
                 a_ij.append(ij)
                 src.append(i)
@@ -97,67 +97,47 @@ def spatial_adjacency(q):
     ei = torch.tensor([src,dst])
     return ei, a_ij
 
-'''
-# Obselete. Implemented as a module now 
-def u_alpha(p, q, i, neighbors, adj):
-    """ Eq. 24 """ 
-    n = neighbors.shape[0]
-    q_i = np.take(q, [i], axis=0).repeat(n, axis=0)
-    q_neigh = q[neighbors]
-
-    phi_a = phi(sigma_norm(q_neigh-q_i))
-    n_ij = sigma_norm_gradient(q_neigh-q_i)
-    term1 = (phi_a * n_ij).sum(axis=0)
-
-    p_i = np.take(p, [i], azis=0).repeat(n, axis=0)
-    p_neigh = p[neighbors]
-    a_ij = adj[i][neighbors][:,None]
-    term2 = (a_ij * (p_neigh - p_i)).sum(axis=0)
-
-    return term1 + term2
-'''
-
-from torch_geometric.utils import to_edge_index
 class Boids(Module):
     def forward(self, q,v, ei=None, dim_size=None):
         '''
             x: tuple of (q,p) velocity and position
             ei: edge index (need both src and dst)
         '''
-        # Need to calculate this for term 2 anyway, so just do it and don't 
+        # Need to calculate this for term 2 anyway, so just do it and don't
         # require ei explicitly input
         ei, a_ij = spatial_adjacency(q)  # V x V
         src,dst = ei
 
         # Attraction/repulsion term
         phi_a = phi( sigma_norm(q[dst] - q[src]) )
-        n_ij = sigma_norm_gradient(q[dst] - q[src]) 
+        n_ij = sigma_norm_gradient(q[dst] - q[src])
         term1 = phi_a * n_ij
-        term1 = scatter_add(term1, dst, dim=0, dim_size=dim_size) # V x d
+        term1 = scatter(term1, dst, dim=0, dim_size=dim_size, reduce='sum') # V x d
 
-        # Alignment term 
+        # Alignment term
         term2 = a_ij[:,None] * (v[dst] - v[src])
-        term2 = scatter_add(term2, dst, dim=0, dim_size=dim_size)
+        term2 = scatter(term2, dst, dim=0, dim_size=dim_size, reduce='sum')
 
         return term1 + term2
 
-class Flock(): 
-    def __init__(self, n, dt=DT):
-        self.q = torch.randn(n,2) * D
-        self.v = torch.zeros(n,2)
+class Flock():
+    def __init__(self, n, device='cpu', dt=DT):
+        self.q = torch.randn(n,2, device=device) * D
+        self.v = torch.zeros(n,2, device=device)
+        self.device = device
 
-        self.boid = Boids() 
-        self.dt = dt 
+        self.boid = Boids()
+        self.dt = dt
 
     def step(self):
         dv = self.boid.forward(self.q, self.v)
         self.v += dv * self.dt
-        self.q += self.v * self.dt 
+        self.q += self.v * self.dt
 
-if __name__ == '__main__': 
-    # Tests 
+if __name__ == '__main__':
+    # Tests
     q = torch.randn(100,2) * D
     v = torch.zeros(100,2)
-    b = Boids() 
+    b = Boids()
 
     b.forward(q,v)
